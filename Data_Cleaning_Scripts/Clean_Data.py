@@ -19,17 +19,16 @@ def process_ecg_data(input_filepath, output_filepath):
     try:
         print(f"Processing ECG file: {input_filepath}...")
         ecg_df = pd.read_csv(input_filepath)
+        if ecg_df.empty:
+            print(f"Warning: Input ECG file is empty: {input_filepath}")
+            return
         ecg_df.columns = ['Time', 'EcgWaveform']
         ecg_df['Time'] = pd.to_datetime(ecg_df['Time'], format='%d/%m/%Y %H:%M:%S.%f', errors='coerce')
         ecg_df.dropna(subset=['Time'], inplace=True)
         
-        # Set 'Time' as the index for resampling
         ecg_df.set_index('Time', inplace=True)
-        
-        # Resample to 1-minute intervals and calculate the mean
         ecg_resampled = ecg_df['EcgWaveform'].resample('1T').mean()
         
-        # Convert back to a DataFrame
         ecg_resampled_df = ecg_resampled.reset_index()
         ecg_resampled_df.rename(columns={'Time': 'Timestamp'}, inplace=True)
 
@@ -57,17 +56,16 @@ def process_cgm_data(input_filepath, output_filepath):
     try:
         print(f"Processing CGM file: {input_filepath}...")
         cgm_df = pd.read_csv(input_filepath)
+        if cgm_df.empty:
+            print(f"Warning: Input CGM file is empty: {input_filepath}")
+            return
         cgm_df['Timestamp'] = pd.to_datetime(cgm_df['date'] + ' ' + cgm_df['time'], errors='coerce')
         cgm_df.dropna(subset=['Timestamp'], inplace=True)
         cgm_df = cgm_df[cgm_df['type'] == 'cgm'].copy()
         
-        # Set 'Timestamp' as the index for resampling
         cgm_df.set_index('Timestamp', inplace=True)
+        cgm_resampled = cgm_df['glucose'].resample('1T').mean().interpolate(method='linear')
         
-        # Resample to 1-minute intervals and interpolate
-        cgm_resampled = cgm_df['glucose'].resample('1T').interpolate(method='linear')
-        
-        # Convert back to a DataFrame
         cgm_resampled_df = cgm_resampled.reset_index()
         cgm_resampled_df.rename(columns={'glucose': 'Glucose'}, inplace=True)
 
@@ -80,12 +78,11 @@ def process_cgm_data(input_filepath, output_filepath):
 
 def merge_resampled_data(cgm_file, ecg_files, output_filepath):
     """
-    Merges one resampled CGM file with multiple resampled ECG files.
+    Merges one resampled CGM file with multiple resampled ECG files using an INNER join.
 
     - Reads and concatenates all ECG files.
     - Reads the CGM file.
-    - Performs an outer merge on the Timestamp to combine all data.
-    - Fills any remaining missing values after the merge.
+    - Performs an INNER merge on the Timestamp to combine data only where timestamps overlap.
     - Rounds the numerical columns to two decimal places.
     - Saves the final merged dataset.
 
@@ -96,33 +93,50 @@ def merge_resampled_data(cgm_file, ecg_files, output_filepath):
     """
     try:
         print("\nMerging all resampled data...")
+        
         # Load the processed CGM data
+        if not os.path.exists(cgm_file):
+            print(f"Error: Processed CGM file not found: {cgm_file}. Aborting merge.")
+            return
         cgm_df = pd.read_csv(cgm_file, parse_dates=['Timestamp'])
+        if cgm_df.empty:
+            print("Warning: CGM data is empty after processing. Merge will likely be empty.")
+            return
 
         # Load and concatenate all processed ECG files
-        ecg_df_list = [pd.read_csv(f, parse_dates=['Timestamp']) for f in ecg_files]
+        ecg_df_list = []
+        for f in ecg_files:
+            if os.path.exists(f):
+                df = pd.read_csv(f, parse_dates=['Timestamp'])
+                if not df.empty:
+                    ecg_df_list.append(df)
+            else:
+                print(f"Warning: Processed ECG file not found: {f}. Skipping.")
+        
+        if not ecg_df_list:
+            print("Error: No valid processed ECG data found. Aborting merge.")
+            return
+            
         all_ecg_df = pd.concat(ecg_df_list).sort_values(by='Timestamp').reset_index(drop=True)
-        
-        # Since ECG data is already averaged per minute per file, we can set index and merge
-        cgm_df.set_index('Timestamp', inplace=True)
-        all_ecg_df.set_index('Timestamp', inplace=True)
+        all_ecg_df.dropna(inplace=True) # Drop rows with NaN from resampling before merge
 
-        # Merge CGM and ECG data using an outer join to keep all timestamps
-        merged_df = pd.merge(cgm_df, all_ecg_df, on='Timestamp', how='outer')
-        
-        # After merging, it's a good practice to handle potential NaNs.
-        # We can interpolate both signals again to fill gaps created by the outer merge.
-        merged_df['Glucose'] = merged_df['Glucose'].interpolate(method='linear')
-        merged_df['EcgWaveform'] = merged_df['EcgWaveform'].interpolate(method='linear')
+        print(f"Diagnostic: CGM data has {len(cgm_df)} rows. Time range: {cgm_df['Timestamp'].min()} to {cgm_df['Timestamp'].max()}")
+        print(f"Diagnostic: Combined ECG data has {len(all_ecg_df)} rows. Time range: {all_ecg_df['Timestamp'].min()} to {all_ecg_df['Timestamp'].max()}")
 
-        # Drop any rows that still have NaN values (usually at the very beginning or end)
-        merged_df.dropna(inplace=True)
+        # Perform an INNER merge to keep only overlapping timestamps
+        merged_df = pd.merge(cgm_df, all_ecg_df, on='Timestamp', how='inner')
         
+        print(f"Diagnostic: Found {len(merged_df)} overlapping rows after merge.")
+
+        if merged_df.empty:
+            print("Warning: The merged file is empty. This means there were no overlapping timestamps between the CGM and ECG data.")
+            # Still save the empty file with headers so the process completes
+            pd.DataFrame(columns=['Timestamp', 'Glucose', 'EcgWaveform']).to_csv(output_filepath, index=False)
+            return
+
         # Round the final data to two decimal places
         merged_df[['Glucose', 'EcgWaveform']] = merged_df[['Glucose', 'EcgWaveform']].round(2)
         
-        merged_df.reset_index(inplace=True)
-
         os.makedirs(os.path.dirname(output_filepath), exist_ok=True)
         merged_df.to_csv(output_filepath, index=False)
         print(f"Successfully merged all data and saved to {output_filepath}")
@@ -133,17 +147,18 @@ def merge_resampled_data(cgm_file, ecg_files, output_filepath):
 
 if __name__ == '__main__':
     # Define file paths for a single patient
-    patient_id = 'Patient_1'
+    patient_id = 'Patient_9'
     base_path = f'Patient_Data/{patient_id}'
     
     # Input files
     raw_ecg_files = [
-        f'{base_path}/ecg_data/2014_10_01-10_09_39/2014_10_01-10_09_39_ECG.csv',
-        f'{base_path}/ecg_data/2014_10_02-10_56_44/2014_10_02-10_56_44_ECG.csv',
-        f'{base_path}/ecg_data/2014_10_03-06_36_24/2014_10_03-06_36_24_ECG.csv',
-        f'{base_path}/ecg_data/2014_10_04-06_34_57/2014_10_04-06_34_57_ECG.csv',
+        f'Patient_Data/Patient_9/ecg_data/2014_10_01-05_59_30/2014_10_01-05_59_30_ECG.csv',
+        f'Patient_Data/Patient_9/ecg_data/2014_10_02-06_14_52/2014_10_02-06_14_52_ECG.csv',
+        f'Patient_Data/Patient_9/ecg_data/2014_10_03-08_21_59/2014_10_03-08_21_59_ECG.csv',
+        f'Patient_Data/Patient_9/ecg_data/2014_10_04-09_09_29/2014_10_04-09_09_29_ECG.csv',
+        f'Patient_Data/Patient_9/ecg_data/2014_10_04-15_03_37/2014_10_04-15_03_37_ECG.csv',
     ]
-    raw_cgm_file = f'{base_path}/glucose.csv'
+    raw_cgm_file = f'Patient_Data/Patient_9/glucose.csv'
 
     # Define paths for processed (cleaned and resampled) files
     processed_ecg_files = [f.replace('.csv', '_processed.csv') for f in raw_ecg_files]
